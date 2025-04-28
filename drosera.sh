@@ -494,8 +494,8 @@ main_menu(){
   while true; do
     cat <<EOF
 
-=== Drosera 自动部署脚本 2.0 ===
-1) 一键部署
+=== Drosera 自动部署脚本 ===
+1) 一键部署（傻瓜式）
 2) 设置 Bloom Boost 限制百分比
 3) 查看日志
 4) 重启节点
