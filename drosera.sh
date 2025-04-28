@@ -184,7 +184,7 @@ deploy_trap(){
   init_env
   echo "==> 部署 Trap 合约"
   safe_cd "$TRAP_HOME"
-
+  # rm -rf "$TRAP_HOME"/*
   # 确保工具
   command -v bun    >/dev/null 2>&1 || { curl -fsSL https://bun.sh/install | bash; export PATH="$HOME/.bun/bin:$PATH"; }
   command -v forge  >/dev/null 2>&1 || { curl -fsSL https://foundry.paradigm.xyz | bash; export PATH="$HOME/.foundry/bin:$PATH"; foundryup; }
