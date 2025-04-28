@@ -123,7 +123,6 @@ generate_configs(){
   init_env
   echo "==> 生成 docker-compose 模板"
   safe_cd "$SCRIPT_HOME"
-  # 假设 .env 已在一键部署里生成，直接 load
   set -a; source "$ENV_FILE"; set +a
 
   cat > "$TPL_FILE" <<'EOF'
