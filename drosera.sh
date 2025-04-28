@@ -254,7 +254,7 @@ deploy_trap(){
   sleep $WAIT_SHORT
 }
 
-########## 4) 设置 Bloom Boost 限制百分比 ##########
+########## 4) 设置 Bloom Boost 百分比 ##########
 set_bloomboost_limit(){
   init_env
   echo "==> 设置 Bloom Boost 限制百分比"
@@ -496,7 +496,7 @@ main_menu(){
 
 === Drosera 自动部署脚本 ===
 1) 一键部署（傻瓜式）
-2) 设置 Bloom Boost 限制百分比
+2) 设置 Bloom Boost 百分比
 3) 查看日志
 4) 重启节点
 5) 添加第二台 Operator
