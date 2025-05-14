@@ -285,7 +285,7 @@ register_and_start(){
   tar -xzf /tmp/operator.tar.gz -C /usr/local/bin drosera-operator
   rm /tmp/operator.tar.gz
 
-  $COMPOSE_CMD pull drosera
+  $COMPOSE_CMD -f "$COMPOSE_FILE" pull drosera
   sleep $WAIT_SHORT
 
   cnt=0
