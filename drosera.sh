@@ -78,13 +78,14 @@ install_all(){
   sleep $WAIT_SHORT
 
   echo "==> 检查并安装 Docker Compose"
-  if ! command -v docker-compose &>/dev/null && ! docker compose version &>/dev/null; then
+  if ! command -v docker-compose &>/dev/null; then
+    echo "🔄 未检测到 docker-compose，开始安装…"
     curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
       -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose
     docker-compose --version &>/dev/null || die "Docker Compose 安装失败"
+    echo "✔️ Docker Compose 安装完成 ($(docker-compose --version))"
   else
-    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
-      -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose
+    echo "✔️ 检测到 docker-compose ($(docker-compose --version))，跳过下载"
   fi
   sleep $WAIT_SHORT
 
@@ -266,26 +267,25 @@ deploy_trap(){
   sleep $WAIT_SHORT
 }
 
-########## 4) 注册 & 启动首台 Operator （支持 ARM 服务器检测） ##########
 register_and_start(){
   init_env
   echo "==> 注册 & 启动首台 Operator"
 
-  # 检测操作系统架构，决定下载哪种二进制
+  # 1) 检测操作系统架构，决定下载哪种二进制
   ARCH=$(uname -m)
   case "$ARCH" in
-    x86_64)  ARCH_TAG="x86_64-unknown-linux-gnu";;
+    x86_64)      ARCH_TAG="x86_64-unknown-linux-gnu";;
     aarch64|arm64) ARCH_TAG="aarch64-unknown-linux-gnu";;
-    *) die "不支持的架构: $ARCH";;
+    *)           die "不支持的架构: $ARCH";;
   esac
 
-  # 下载对应架构的 drosera-operator 并安装
+  # 2) 下载对应架构的 drosera-operator 并安装
   curl -fsSL "https://github.com/drosera-network/releases/releases/download/${TARGET_VERSION}/drosera-operator-${TARGET_VERSION}-${ARCH_TAG}.tar.gz" \
     -o /tmp/operator.tar.gz
   tar -xzf /tmp/operator.tar.gz -C /usr/local/bin drosera-operator
   rm /tmp/operator.tar.gz
 
-  # 注册 Operator，最多重试 3 次
+  # 3) 在链上注册 Operator，最多重试 3 次
   echo "==> 注册 Operator"
   cnt=0
   while :; do
@@ -301,7 +301,32 @@ register_and_start(){
     sleep $WAIT_SHORT
   done
 
-  # 渲染并启动 drosera 容器（自动拉取最新镜像）
+  # 4) 将第一台 Operator 写入本地 drosera.toml 的 whitelist
+  echo "==> 将第一台 Operator 加入 whitelist"
+  safe_cd "$TRAP_HOME"
+  set -a; source "$ENV_FILE"; set +a
+  sed -i "/^whitelist/c\whitelist = [\"${OPERATOR1_ADDRESS}\"]" drosera.toml
+
+  # 5) 在链上 apply 更新后的 whitelist（处理 ConfigUpdateCooldownNotElapsed 重试）
+  echo "==> 链上更新 whitelist"
+  safe_cd "$TRAP_HOME"
+  retry=0
+  until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
+       drosera apply --eth-rpc-url "$ETH_RPC_URL" 2>&1 | tee /tmp/whitelist_apply.log; do
+    if grep -q "ConfigUpdateCooldownNotElapsed" /tmp/whitelist_apply.log; then
+      ((retry++)) && [[ $retry -ge 3 ]] && die "白名单 apply 冷却重试失败"
+      echo "⚠️ 白名单操作还在冷却时间内，等待 ${COOLDOWN_WAIT}s… ($retry/3)"
+      sleep $COOLDOWN_WAIT
+      continue
+    fi
+    cat /tmp/whitelist_apply.log
+    die "白名单 apply 失败，请查看 /tmp/whitelist_apply.log"
+  done
+  echo "✔️ 白名单 apply 完成"
+  rm /tmp/whitelist_apply.log
+
+
+  # 6) 渲染并启动 drosera 容器（自动拉取最新镜像）
   echo "==> 渲染并启动 drosera 容器"
   safe_cd "$SCRIPT_HOME"
   envsubst < "$TPL_FILE" > "$COMPOSE_FILE" || die "渲染 $COMPOSE_FILE 失败"
@@ -316,6 +341,7 @@ add_second_operator(){
   [[ -f "$ENV_FILE" ]] || die ".env 不存在，请先生成配置"
   set -a; source "$ENV_FILE"; set +a
 
+  # 1) 读或写入 ETH_PRIVATE_KEY2 & OPERATOR2_ADDRESS
   if [[ -n "${ETH_PRIVATE_KEY2:-}" && -n "${OPERATOR2_ADDRESS:-}" ]]; then
     echo "✔️ 检测到 .env 中已有第二台配置"
   else
@@ -323,10 +349,28 @@ add_second_operator(){
     read -rp "第二台 公钥地址: " OPERATOR2_ADDRESS
     sed -i "/^ETH_PRIVATE_KEY2=/d" "$ENV_FILE"
     sed -i "/^OPERATOR2_ADDRESS=/d" "$ENV_FILE"
-    printf "ETH_PRIVATE_KEY2=\"%s\"\nOPERATOR2_ADDRESS=\"%s\"\n" "$ETH_PRIVATE_KEY2" "$OPERATOR2_ADDRESS" >> "$ENV_FILE"
+    printf "ETH_PRIVATE_KEY2=\"%s\"\nOPERATOR2_ADDRESS=\"%s\"\n" \
+      "$ETH_PRIVATE_KEY2" "$OPERATOR2_ADDRESS" >> "$ENV_FILE"
+    set -a; source "$ENV_FILE"; set +a
   fi
-  set -a; source "$ENV_FILE"; set +a
 
+  # 2) 在链上注册第二台 Operator
+  echo "==> 注册第二台 Operator"
+  cnt=0
+  while :; do
+    out=$(drosera-operator register \
+      --eth-rpc-url "$ETH_RPC_URL" \
+      --eth-private-key "$ETH_PRIVATE_KEY2" 2>&1) || true
+    if [[ $? -eq 0 ]] || echo "$out" | grep -q OperatorAlreadyRegistered; then
+      echo "✔️ 第二台 注册完成"
+      break
+    fi
+    ((cnt++)) && [[ $cnt -ge 3 ]] && die "第二台 注册失败: $out"
+    echo "等待 ${WAIT_SHORT}s… ($cnt/3)"; sleep $WAIT_SHORT
+  done
+
+  # 3) 更新本地 toml 白名单
+  echo "==> 更新 drosera.toml 白名单"
   safe_cd "$TRAP_HOME"
   raw=$(grep -E '^[[:space:]]*whitelist' drosera.toml | sed -E 's/.*\[(.*)\].*/\1/')
   new_list="${raw},\"$OPERATOR2_ADDRESS\""
@@ -334,20 +378,25 @@ add_second_operator(){
   grep -q '^private_trap' drosera.toml || echo 'private_trap = true' >> drosera.toml
   echo "✔️ drosera.toml 白名单更新: [$new_list]"
 
-  echo "-> 白名单 apply"
+  # 4) 链上 apply 白名单更新
+  echo "==> 链上 apply 白名单"
   retry=0
-  until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" drosera apply --eth-rpc-url "$ETH_RPC_URL"; do
-    ((retry++)) && [[ $retry -ge 3 ]] && die "第二台 白名单 apply 失败"
+  until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
+        drosera apply --eth-rpc-url "$ETH_RPC_URL"; do
+    ((retry++)) && [[ $retry -ge 3 ]] && die "白名单 apply 失败"
     echo "冷却 ${COOLDOWN_WAIT}s… ($retry/3)"; sleep $COOLDOWN_WAIT
   done
-  echo "✔️ 第二台 白名单 apply 完成"
+  echo "✔️ 白名单 apply 完成"
 
-  echo "==> 启动第二台 drosera2"
+  # 5) 启动第二台容器
+  echo "==> 启动 drosera2 容器"
   safe_cd "$SCRIPT_HOME"
   envsubst < "$TPL_FILE" > "$COMPOSE_FILE"
-  $COMPOSE_CMD up -d drosera2
+  $COMPOSE_CMD up -d drosera2 || die "drosera2 启动失败"
   sleep $WAIT_SHORT
 
+  # 6) optin 第二台 Operator
+  echo "==> 第二台 Operator optin"
   retry=0
   until drosera-operator optin \
       --eth-rpc-url "$ETH_RPC_URL" \
@@ -358,6 +407,7 @@ add_second_operator(){
   done
   echo "✔️ 第二台 Opt-in 成功"
 }
+
 
 ########## 6) 服务器迁移 功能 ##########
 migrate_server(){
