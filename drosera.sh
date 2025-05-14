@@ -271,51 +271,42 @@ register_and_start(){
   init_env
   echo "==> 注册 & 启动首台 Operator"
 
-  # Detect architecture for operator binary
+  # 检测操作系统架构，决定下载哪种二进制
   ARCH=$(uname -m)
   case "$ARCH" in
-    x86_64) ARCH_TAG="x86_64-unknown-linux-gnu";;
+    x86_64)  ARCH_TAG="x86_64-unknown-linux-gnu";;
     aarch64|arm64) ARCH_TAG="aarch64-unknown-linux-gnu";;
     *) die "不支持的架构: $ARCH";;
   esac
 
-  # 下载对应架构的 drosera-operator
+  # 下载对应架构的 drosera-operator 并安装
   curl -fsSL "https://github.com/drosera-network/releases/releases/download/${TARGET_VERSION}/drosera-operator-${TARGET_VERSION}-${ARCH_TAG}.tar.gz" \
     -o /tmp/operator.tar.gz
   tar -xzf /tmp/operator.tar.gz -C /usr/local/bin drosera-operator
   rm /tmp/operator.tar.gz
 
-  $COMPOSE_CMD -f "$COMPOSE_FILE" pull drosera
-  sleep $WAIT_SHORT
-
+  # 注册 Operator，最多重试 3 次
+  echo "==> 注册 Operator"
   cnt=0
   while :; do
-    out=$(drosera-operator register --eth-rpc-url "$ETH_RPC_URL" --eth-private-key "$ETH_PRIVATE_KEY" 2>&1) || true
+    out=$(drosera-operator register \
+      --eth-rpc-url "$ETH_RPC_URL" \
+      --eth-private-key "$ETH_PRIVATE_KEY" 2>&1) || true
     if [[ $? -eq 0 ]] || echo "$out" | grep -q OperatorAlreadyRegistered; then
-      echo "✔️ 注册完成"; break
+      echo "✔️ 注册完成"
+      break
     fi
     ((cnt++)) && [[ $cnt -ge 3 ]] && die "注册失败: $out"
-    echo "等待 ${WAIT_SHORT}s… ($cnt/3)"; sleep $WAIT_SHORT
+    echo "等待 ${WAIT_SHORT}s… ($cnt/3)"
+    sleep $WAIT_SHORT
   done
 
-  echo "-> 启动 drosera 容器"
+  # 渲染并启动 drosera 容器（自动拉取最新镜像）
+  echo "==> 渲染并启动 drosera 容器"
   safe_cd "$SCRIPT_HOME"
-  envsubst < "$TPL_FILE" > "$COMPOSE_FILE"
-  $COMPOSE_CMD up -d drosera
+  envsubst < "$TPL_FILE" > "$COMPOSE_FILE" || die "渲染 $COMPOSE_FILE 失败"
+  $COMPOSE_CMD up -d --pull=always drosera || die "容器启动失败"
   sleep $WAIT_SHORT
-
-  cnt=0
-  while :; do
-    out=$(drosera-operator optin \
-      --eth-rpc-url "$ETH_RPC_URL" \
-      --eth-private-key "$ETH_PRIVATE_KEY" \
-      --trap-config-address "$TRAP_ADDRESS" \
-      2>&1) || true
-    [[ $? -eq 0 ]] && { echo "✔️ 首台 Opt-in 成功"; break; }
-    ((cnt++)) && [[ $cnt -ge 3 ]] && die "首台 Opt-in 失败: $out"
-    echo "等待 ${WAIT_SHORT}s… ($cnt/3)"; sleep $WAIT_SHORT
-  done
-  echo "首台 Operator 启动并 Opt-in 完成"
 }
 
 ########## 5) 添加第二台 Operator ##########
