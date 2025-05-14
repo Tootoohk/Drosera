@@ -14,14 +14,14 @@ cat << 'EOF'
 
             Drosera 自动部署脚本
     作者: ChatGPT o4-mini-high、@Tootoohkk
-    参考: 漆华@ferdie_jhovie 脚本 · 官方文档 https://dev.drosera.io/
+    参考: Drosera 官方文档 https://dev.drosera.io/
 EOF
 }
 
-
-
 ############### 全局配置 ###############
-DROPER_VER="v1.16.2"
+TARGET_VERSION="v1.17.2"
+TARGET_RPC="https://relay.testnet.drosera.io"
+
 TRAP_TEMPLATE="drosera-network/trap-foundry-template"
 FOUNDATION_RPC="https://ethereum-holesky-rpc.publicnode.com"
 BACKUP_RPC="https://holesky.drpc.org"
@@ -37,6 +37,13 @@ TPL_FILE="$SCRIPT_HOME/docker-compose.tpl.yaml"
 COMPOSE_FILE="$SCRIPT_HOME/docker-compose.yaml"
 #########################################
 
+# 选择 docker-compose 命令
+if command -v docker-compose &>/dev/null; then
+  COMPOSE_CMD="docker-compose"
+else
+  COMPOSE_CMD="docker compose"
+fi
+
 die(){ echo "[ERROR] $*" >&2; exit 1; }
 safe_cd(){ mkdir -p "$1"; cd "$1" || die "无法进入目录 $1"; }
 
@@ -48,12 +55,11 @@ init_env(){
 ########## 1) 安装依赖与工具 ##########
 install_all(){
   echo "==> 安装/检查系统依赖"
-  : "${PS1:=}"
   while fuser /var/lib/apt/lists/lock &>/dev/null; do sleep 1; done
   apt-get update && apt-get upgrade -y
   apt-get install -y software-properties-common unzip \
     apt-transport-https ca-certificates curl gnupg lsb-release \
-    make gcc nano jq git || die "基础依赖安装失败"
+    make gcc nano jq git gettext-base || die "基础依赖安装失败"
   echo "✔️ 基础依赖就绪"
   sleep $WAIT_SHORT
 
@@ -68,10 +74,17 @@ install_all(){
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin || die "Docker 安装失败"
     echo "✔️ Docker 安装完成"
   fi
-  if command -v systemctl &>/dev/null; then
-    systemctl enable --now docker \
-      && echo "✔️ docker 服务已启用并启动" \
-      || echo "[WARN] 无法启用/启动 docker.service，已跳过"
+  systemctl enable --now docker &>/dev/null || echo "[WARN] 无法启用 docker.service"
+  sleep $WAIT_SHORT
+
+  echo "==> 检查并安装 Docker Compose"
+  if ! command -v docker-compose &>/dev/null && ! docker compose version &>/dev/null; then
+    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+      -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose
+    docker-compose --version &>/dev/null || die "Docker Compose 安装失败"
+  else
+    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+      -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose
   fi
   sleep $WAIT_SHORT
 
@@ -82,9 +95,8 @@ install_all(){
     curl -fsSL https://bun.sh/install | bash || die "Bun 安装失败"
     export PATH="$HOME/.bun/bin:$PATH"
     echo 'export PATH="$HOME/.bun/bin:$PATH"' >> "$HOME/.bashrc"
-    echo "✔️ bun 安装完成"
+    sleep $WAIT_SHORT
   fi
-  sleep $WAIT_SHORT
 
   echo "==> 检查并安装 Foundry"
   if command -v forge &>/dev/null; then
@@ -99,35 +111,45 @@ install_all(){
   sleep $WAIT_SHORT
 
   echo "==> 检查并安装 Drosera CLI"
-  if command -v drosera &>/dev/null; then
-    echo "✔️ drosera 已安装 ($(drosera --version))"
-  else
-    curl -fsSL https://app.drosera.io/install | bash || die "Drosera CLI 安装失败"
-    export PATH="$HOME/.drosera/bin:$PATH"
-    echo 'export PATH="$HOME/.drosera/bin:$PATH"' >> "$HOME/.bashrc"
-    set +u; source "$HOME/.bashrc"; set -u
-    droseraup || die "droseraup 执行失败"
-  fi
+  DROSERA_BIN_DIR="$HOME/.drosera/bin"
+  curl -fsSL https://app.drosera.io/install | bash \
+    || die "Drosera 安装脚本下载失败"
+  "${DROSERA_BIN_DIR}/droseraup" \
+    || die "droseraup 安装 drosera 失败"
+  export PATH="$DROSERA_BIN_DIR:$PATH"
+  echo "✔️ drosera 安装完成 ($(${DROSERA_BIN_DIR}/drosera --version))"
   sleep $WAIT_SHORT
 
-  echo "==> 验证其它命令"
+  echo "==> 验证全部命令"
   for cmd in docker docker-compose bun forge drosera drosera-operator envsubst jq git; do
     command -v $cmd &>/dev/null || die "缺少命令：$cmd"
     echo "✔️ $cmd 就绪"
   done
+
   echo "所有依赖安装完毕！"
 }
 
-########## 2) 根据现有 .env 生成 docker-compose 模板 ##########
+
+
+########## 2) 生成 docker-compose 模板（RPC 参数加双引号） ##########
 generate_configs(){
   init_env
   echo "==> 生成 docker-compose 模板"
   safe_cd "$SCRIPT_HOME"
   set -a; source "$ENV_FILE"; set +a
 
-  cat > "$TPL_FILE" <<'EOF'
+  # 根据主机架构决定 platform 字段
+  ARCH=$(uname -m)
+  if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+    PLATFORM_LINE="    platform: linux/amd64"
+  else
+    PLATFORM_LINE=""
+  fi
+
+  cat > "$TPL_FILE" << EOF
 services:
   drosera:
+${PLATFORM_LINE}
     image: ghcr.io/drosera-network/drosera-operator:latest
     container_name: drosera-node
     ports:
@@ -139,16 +161,22 @@ services:
       node --db-file-path /data/drosera.db
            --network-p2p-port 31313
            --server-port 31314
-           --eth-rpc-url ${ETH_RPC_URL}
-           --eth-backup-rpc-url ${ETH_BACKUP_RPC_URL}
+           --eth-rpc-url "\${ETH_RPC_URL}"
+           --eth-backup-rpc-url "\${ETH_BACKUP_RPC_URL}"
            --drosera-address 0xea08f7d533C2b9A62F40D5326214f39a8E3A32F8
-           --eth-private-key ${ETH_PRIVATE_KEY}
+           --eth-private-key \${ETH_PRIVATE_KEY}
            --listen-address 0.0.0.0
-           --network-external-p2p-address ${VPS_IP}
+           --network-external-p2p-address \${VPS_IP}
            --disable-dnr-confirmation true
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   drosera2:
+${PLATFORM_LINE}
     image: ghcr.io/drosera-network/drosera-operator:latest
     container_name: drosera-node-2
     ports:
@@ -160,14 +188,19 @@ services:
       node --db-file-path /data/drosera.db
            --network-p2p-port 31315
            --server-port 31316
-           --eth-rpc-url ${ETH_RPC_URL}
-           --eth-backup-rpc-url ${ETH_BACKUP_RPC_URL}
+           --eth-rpc-url "\${ETH_RPC_URL}"
+           --eth-backup-rpc-url "\${ETH_BACKUP_RPC_URL}"
            --drosera-address 0xea08f7d533C2b9A62F40D5326214f39a8E3A32F8
-           --eth-private-key ${ETH_PRIVATE_KEY2}
+           --eth-private-key \${ETH_PRIVATE_KEY2}
            --listen-address 0.0.0.0
-           --network-external-p2p-address ${VPS_IP}
+           --network-external-p2p-address \${VPS_IP}
            --disable-dnr-confirmation true
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 volumes:
   drosera_data:
@@ -178,13 +211,13 @@ EOF
   sleep $WAIT_SHORT
 }
 
+
 ########## 3) 部署 Trap 合约 & Bloom Boost ##########
 deploy_trap(){
   init_env
   echo "==> 部署 Trap 合约"
   safe_cd "$TRAP_HOME"
-  # rm -rf "$TRAP_HOME"/*
-  # 确保工具
+
   command -v bun    >/dev/null 2>&1 || { curl -fsSL https://bun.sh/install | bash; export PATH="$HOME/.bun/bin:$PATH"; }
   command -v forge  >/dev/null 2>&1 || { curl -fsSL https://foundry.paradigm.xyz | bash; export PATH="$HOME/.foundry/bin:$PATH"; foundryup; }
   command -v drosera >/dev/null 2>&1 || { curl -fsSL https://app.drosera.io/install | bash; export PATH="$HOME/.drosera/bin:$PATH"; droseraup; }
@@ -192,20 +225,20 @@ deploy_trap(){
   git config --global user.email "drosera@local" || true
   git config --global user.name  "Drosera"       || true
   forge init -t "$TRAP_TEMPLATE" || die "Forge init 失败"
-  bun install && forge build        || die "Forge build 失败"
+  bun install && forge build     || die "Forge build 失败"
 
   set -a; source "$ENV_FILE"; set +a
 
   echo "-> 首次 apply"
   retry=0
-  while true; do
+  while :; do
     printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
-      drosera apply --eth-rpc-url "$ETH_RPC_URL" 2>&1 | tee /tmp/first_apply.log || true
+      drosera apply --eth-rpc-url "$ETH_RPC_URL" 2>&1 \
+      | tee /tmp/first_apply.log || true
     if grep -qE "Created.*Trap Config|Updated.*Trap Config|No changes to apply" /tmp/first_apply.log; then
-      echo "✔️ Trap Config apply 完成"
-      break
+      echo "✔️ Trap Config apply 完成"; break
     fi
-    ((retry++))&&[[ $retry -ge 3 ]]&&die "首次 apply 失败，请查看 /tmp/first_apply.log"
+    ((retry++)) && [[ $retry -ge 3 ]] && die "首次 apply 失败，请查看 /tmp/first_apply.log"
     echo "等待冷却 ${COOLDOWN_WAIT}s… ($retry/3)"; sleep $COOLDOWN_WAIT
   done
 
@@ -217,36 +250,15 @@ deploy_trap(){
   export DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY"
   printf 'ofc\n' | drosera bloomboost \
     --trap-address "$TRAP_ADDRESS" \
-    --eth-amount   "$BLOOM_BOOST_AMOUNT" 2>&1 \
-    | tee /tmp/bloomboost.log || true
+    --eth-amount   "$BLOOM_BOOST_AMOUNT" \
+    2>&1 | tee /tmp/bloomboost.log || true
   if grep -q "Trap boosted" /tmp/bloomboost.log; then
     echo "✔️ Bloom Boost 成功"
   else
-    cat /tmp/bloomboost.log; die "Bloom Boost 失败，请查看 /tmp/bloomboost.log"
+    cat /tmp/bloomboost.log; die "Bloom Boost 失败，请查看日志"
   fi
   unset DROSERA_PRIVATE_KEY
   sleep $WAIT_SHORT
-
-  # —— 自动白名单，无需再手动输入 Operator 公钥 —— 
-  OP_ADDR="${OPERATOR1_ADDRESS}"
-  echo "-> 使用第一台 Operator 公钥加入白名单: $OP_ADDR"
-  sed -i "/^[[:space:]]*whitelist/c\whitelist = [\"$OP_ADDR\"]" drosera.toml
-  grep -q '^private_trap' drosera.toml || echo 'private_trap = true' >> drosera.toml
-
-  echo "-> 白名单 apply"
-  retry=0
-  while true; do
-    printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
-      drosera apply --eth-rpc-url "$ETH_RPC_URL" 2>&1 \
-      | tee /tmp/whitelist_apply.log || true
-    cleaned=$(sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/whitelist_apply.log)
-    echo "---- 白名单 apply 日志 ----"; echo "$cleaned"; echo "--------------------------"
-    if echo "$cleaned" | grep -qE "Created.*Trap Config|Updated.*Trap Config|No changes to apply"; then
-      echo "✔️ 白名单 apply 完成"; break
-    fi
-    ((retry++))&&[[ $retry -ge 3 ]]&&die "白名单 apply 失败，请查看 /tmp/whitelist_apply.log"
-    echo "等待冷却 ${COOLDOWN_WAIT}s… ($retry/3)"; sleep $COOLDOWN_WAIT
-  done
 
   sed -i "/^TRAP_ADDRESS=/d" "$ENV_FILE"
   echo "TRAP_ADDRESS=$TRAP_ADDRESS" >> "$ENV_FILE"
@@ -254,179 +266,234 @@ deploy_trap(){
   sleep $WAIT_SHORT
 }
 
-########## 4) 设置 Bloom Boost 百分比 ##########
-set_bloomboost_limit(){
-  init_env
-  echo "==> 设置 Bloom Boost 限制百分比"
-  echo "详情查看官方文档：https://dev.drosera.io/docs/trappers/setting-bloomboost-percentage"
-  read -rp "请输入 Bloom Boost 限制百分比 (例：100 = 1%，输入100则每次触发扣除余额1%): " pct
-  [[ -n "$pct" ]] || die "必须输入一个百分比"
-
-  # 切到 Trap 目录，确保找到 drosera.toml
-  safe_cd "$TRAP_HOME"
-
-  echo "-> 执行 drosera set-bloomboost-limit ..."
-  # 用 printf 而非 yes，避免 SIGPIPE
-  printf 'ofc\n' | drosera set-bloomboost-limit \
-    --eth-rpc-url      "$ETH_RPC_URL" \
-    --drosera-rpc-url  "https://seed-node.testnet.drosera.io" \
-    --eth-chain-id     17000 \
-    --drosera-address  "0xea08f7d533C2b9A62F40D5326214f39a8E3A32F8" \
-    --private-key      "$ETH_PRIVATE_KEY" \
-    --trap-address     "$TRAP_ADDRESS" \
-    --limit            "$pct" \
-    || die "设置 Bloom Boost 限制失败"
-
-  echo "✔️ 已将 Bloom Boost 限制设置为 $pct"
-}
-
-
-
-########## 5) 注册 & 启动首台 Operator ##########
+########## 4) 注册 & 启动首台 Operator （支持 ARM 服务器检测） ##########
 register_and_start(){
+  init_env
   echo "==> 注册 & 启动首台 Operator"
-  safe_cd ~
 
-  curl -fsSL "https://github.com/drosera-network/releases/releases/download/$DROPER_VER/drosera-operator-$DROPER_VER-x86_64-unknown-linux-gnu.tar.gz" \
-    -o drosera-operator.tar.gz
-  tar -xzf drosera-operator.tar.gz drosera-operator && mv drosera-operator /usr/local/bin/
-  docker pull ghcr.io/drosera-network/drosera-operator:latest
+  # Detect architecture for operator binary
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) ARCH_TAG="x86_64-unknown-linux-gnu";;
+    aarch64|arm64) ARCH_TAG="aarch64-unknown-linux-gnu";;
+    *) die "不支持的架构: $ARCH";;
+  esac
+
+  # 下载对应架构的 drosera-operator
+  curl -fsSL "https://github.com/drosera-network/releases/releases/download/${TARGET_VERSION}/drosera-operator-${TARGET_VERSION}-${ARCH_TAG}.tar.gz" \
+    -o /tmp/operator.tar.gz
+  tar -xzf /tmp/operator.tar.gz -C /usr/local/bin drosera-operator
+  rm /tmp/operator.tar.gz
+
+  $COMPOSE_CMD pull drosera
   sleep $WAIT_SHORT
 
-  init_env
   cnt=0
-  while true; do
-    out=$(drosera-operator register --eth-rpc-url "$ETH_RPC_URL" --eth-private-key "$ETH_PRIVATE_KEY" 2>&1)||true
+  while :; do
+    out=$(drosera-operator register --eth-rpc-url "$ETH_RPC_URL" --eth-private-key "$ETH_PRIVATE_KEY" 2>&1) || true
     if [[ $? -eq 0 ]] || echo "$out" | grep -q OperatorAlreadyRegistered; then
       echo "✔️ 注册完成"; break
     fi
-    ((cnt++))&&[[ $cnt -ge 3 ]]&&die "注册失败：$out"
+    ((cnt++)) && [[ $cnt -ge 3 ]] && die "注册失败: $out"
     echo "等待 ${WAIT_SHORT}s… ($cnt/3)"; sleep $WAIT_SHORT
   done
 
   echo "-> 启动 drosera 容器"
   safe_cd "$SCRIPT_HOME"
   envsubst < "$TPL_FILE" > "$COMPOSE_FILE"
-  docker-compose -f "$COMPOSE_FILE" up -d drosera
+  $COMPOSE_CMD up -d drosera
   sleep $WAIT_SHORT
 
   cnt=0
-  while true; do
-    out=$(drosera-operator optin --eth-rpc-url "$ETH_RPC_URL" --eth-private-key "$ETH_PRIVATE_KEY" --trap-config-address "$TRAP_ADDRESS" 2>&1)||true
-    if [[ $? -eq 0 ]]; then echo "✔️ 首台 Operator Opt-in 成功"; break; fi
-    ((cnt++))&&[[ $cnt -ge 3 ]]&&die "首台 Opt-in 失败：$out"
+  while :; do
+    out=$(drosera-operator optin \
+      --eth-rpc-url "$ETH_RPC_URL" \
+      --eth-private-key "$ETH_PRIVATE_KEY" \
+      --trap-config-address "$TRAP_ADDRESS" \
+      2>&1) || true
+    [[ $? -eq 0 ]] && { echo "✔️ 首台 Opt-in 成功"; break; }
+    ((cnt++)) && [[ $cnt -ge 3 ]] && die "首台 Opt-in 失败: $out"
     echo "等待 ${WAIT_SHORT}s… ($cnt/3)"; sleep $WAIT_SHORT
   done
-
-  echo
-  echo "==> 首台 Operator 启动并 Opt-in 完成"
-  echo "提示：如需查看日志，请运行“功能 3”"
+  echo "首台 Operator 启动并 Opt-in 完成"
 }
 
-########## 6) 添加第二台 Operator ##########
+########## 5) 添加第二台 Operator ##########
 add_second_operator(){
   init_env
   echo "===== 添加第二台 Operator ====="
   [[ -f "$ENV_FILE" ]] || die ".env 不存在，请先生成配置"
-
-  # 加载 .env，如果已有第二台配置就跳过提示
   set -a; source "$ENV_FILE"; set +a
-  if [[ -n "${ETH_PRIVATE_KEY2:-}" && -n "${OPERATOR2_ADDRESS:-}" ]]; then
-    echo "✔️ 检测到 .env 中已有第二台配置，直接使用："
-    echo "   私钥:  ${ETH_PRIVATE_KEY2:0:6}····"
-    echo "   公钥:  $OPERATOR2_ADDRESS"
-  else
-    # 提示用户输入
-    read -rp "第二台 Operator 私钥: " ETH_PRIVATE_KEY2
-    [[ -n "$ETH_PRIVATE_KEY2" ]] || { echo "已取消"; return; }
-    read -rp "第二台 Operator 公钥地址: " OPERATOR2_ADDRESS
-    [[ -n "$OPERATOR2_ADDRESS" ]] || die "未提供第二台公钥"
 
-    # 写入 .env
+  if [[ -n "${ETH_PRIVATE_KEY2:-}" && -n "${OPERATOR2_ADDRESS:-}" ]]; then
+    echo "✔️ 检测到 .env 中已有第二台配置"
+  else
+    read -rp "第二台 私钥: " ETH_PRIVATE_KEY2
+    read -rp "第二台 公钥地址: " OPERATOR2_ADDRESS
     sed -i "/^ETH_PRIVATE_KEY2=/d" "$ENV_FILE"
     sed -i "/^OPERATOR2_ADDRESS=/d" "$ENV_FILE"
-    {
-      echo "ETH_PRIVATE_KEY2=$ETH_PRIVATE_KEY2"
-      echo "OPERATOR2_ADDRESS=$OPERATOR2_ADDRESS"
-    } >> "$ENV_FILE"
-    echo "✔️ 已将第二台配置写入 .env"
+    printf "ETH_PRIVATE_KEY2=\"%s\"\nOPERATOR2_ADDRESS=\"%s\"\n" "$ETH_PRIVATE_KEY2" "$OPERATOR2_ADDRESS" >> "$ENV_FILE"
   fi
-
-  # 重新加载，确保后续步骤可用
   set -a; source "$ENV_FILE"; set +a
 
-  # 确保 Trap 已部署
-  [[ -n "${TRAP_ADDRESS:-}" ]] || die "TRAP_ADDRESS 未设置，请先部署 Trap"
-
   safe_cd "$TRAP_HOME"
-
-  echo "→ 更新 drosera.toml 白名单"
-  raw=$(grep -E '^[[:space:]]*whitelist' drosera.toml || true)
-  raw=${raw#*[}; raw=${raw%]*}; raw=${raw//\"/}
-  [[ -z "${raw// }" ]] && new="\"$OPERATOR2_ADDRESS\"" || new="\"$raw\",\"$OPERATOR2_ADDRESS\""
-  sed -i "/^[[:space:]]*whitelist/c\whitelist = [$new]" drosera.toml
+  raw=$(grep -E '^[[:space:]]*whitelist' drosera.toml | sed -E 's/.*\[(.*)\].*/\1/')
+  new_list="${raw},\"$OPERATOR2_ADDRESS\""
+  sed -i "/^whitelist/c\whitelist = [$new_list]" drosera.toml
   grep -q '^private_trap' drosera.toml || echo 'private_trap = true' >> drosera.toml
-  echo "✔️ drosera.toml 白名单更新为: [$new]"
+  echo "✔️ drosera.toml 白名单更新: [$new_list]"
 
   echo "-> 白名单 apply"
   retry=0
-  while true; do
-    printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
-      drosera apply --eth-rpc-url "$ETH_RPC_URL" 2>&1 \
-      | tee /tmp/second_whitelist.log || true
-
-    # 去掉颜色编码方便阅读
-    cleaned=$(sed -r 's/\x1B\[[0-9;]*[mK]//g' /tmp/second_whitelist.log)
-    echo "---- apply 日志 ----"; echo "$cleaned"; echo "--------------------"
-
-    if echo "$cleaned" | grep -qE "Created.*Trap Config|Updated.*Trap Config|No changes to apply"; then
-      echo "✔️ 第二台 白名单 apply 成功"
-      break
-    fi
-
-    ((retry++)) && [[ $retry -ge 3 ]] && die "第二台 白名单 apply 多次失败，请查看 /tmp/second_whitelist.log"
-    echo "等待冷却 ${COOLDOWN_WAIT}s… ($retry/3)"
-    sleep $COOLDOWN_WAIT
+  until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" drosera apply --eth-rpc-url "$ETH_RPC_URL"; do
+    ((retry++)) && [[ $retry -ge 3 ]] && die "第二台 白名单 apply 失败"
+    echo "冷却 ${COOLDOWN_WAIT}s… ($retry/3)"; sleep $COOLDOWN_WAIT
   done
-
-  echo "==> 注册第二台 Operator"
-  retry=0
-  while true; do
-    out=$(drosera-operator register \
-          --eth-rpc-url "$ETH_RPC_URL" \
-          --eth-private-key "$ETH_PRIVATE_KEY2" 2>&1) || true
-    if [[ $? -eq 0 ]] || echo "$out" | grep -q OperatorAlreadyRegistered; then
-      echo "✔️ 第二台 注册完成"
-      break
-    fi
-    ((retry++)) && [[ $retry -ge 3 ]] && die "第二台 注册失败：$out"
-    echo "等待 ${WAIT_SHORT}s… ($retry/3)"; sleep $WAIT_SHORT
-  done
+  echo "✔️ 第二台 白名单 apply 完成"
 
   echo "==> 启动第二台 drosera2"
   safe_cd "$SCRIPT_HOME"
   envsubst < "$TPL_FILE" > "$COMPOSE_FILE"
-  docker-compose -f "$COMPOSE_FILE" up -d drosera2
-  echo "✔️ drosera2 已启动"
+  $COMPOSE_CMD up -d drosera2
   sleep $WAIT_SHORT
 
-  echo "==> 第二台 Opt-in"
   retry=0
-  while true; do
-    out=$(drosera-operator optin \
-          --eth-rpc-url "$ETH_RPC_URL" \
-          --eth-private-key "$ETH_PRIVATE_KEY2" \
-          --trap-config-address "$TRAP_ADDRESS" 2>&1) || true
-    if [[ $? -eq 0 ]]; then
-      echo "✔️ 第二台 Opt-in 成功"
-      break
-    fi
-    ((retry++)) && [[ $retry -ge 3 ]] && die "第二台 Opt-in 失败：$out"
+  until drosera-operator optin \
+      --eth-rpc-url "$ETH_RPC_URL" \
+      --eth-private-key "$ETH_PRIVATE_KEY2" \
+      --trap-config-address "$TRAP_ADDRESS"; do
+    ((retry++)) && [[ $retry -ge 3 ]] && die "第二台 Opt-in 失败"
     echo "等待 ${WAIT_SHORT}s… ($retry/3)"; sleep $WAIT_SHORT
   done
+  echo "✔️ 第二台 Opt-in 成功"
 }
 
-########## 7) 一键部署（依次执行 1–6） ##########
+########## 6) 服务器迁移 功能 ##########
+migrate_server(){
+  print_banner
+  echo "==> 服务器迁移"
+
+  # —— 0) 准备 Trap 目录 —— 
+  if [[ -f "$TRAP_HOME/drosera.toml" ]]; then
+    echo "✔️ 已检测到完整的 Trap 目录：$TRAP_HOME"
+  else
+    if [[ -f "./trap.tar.gz" ]]; then
+      ARCHIVE="trap.tar.gz"
+    elif [[ -f "./my-drosera-trap.tar.gz" ]]; then
+      ARCHIVE="my-drosera-trap.tar.gz"
+    else
+      die "缺少 Trap 合约目录 $TRAP_HOME 或打包文件 trap.tar.gz/my-drosera-trap.tar.gz  
+请将 my-drosera-trap 目录打包后放在当前目录重试。"
+    fi
+    echo "✔️ 检测到 $ARCHIVE，正在解压到 $TRAP_HOME （去除顶层目录）..."
+    mkdir -p "$TRAP_HOME"
+    tar --strip-components=1 -xzf "./$ARCHIVE" -C "$TRAP_HOME" \
+      || die "解压 $ARCHIVE 失败"
+    echo "✔️ 解压完成：$TRAP_HOME"
+  fi
+
+  # —— 1) 准备 .env —— 
+  if [[ -f "$ENV_FILE" ]]; then
+    echo "✔️ 使用 ENV_FILE：$ENV_FILE"
+  elif [[ -f "./.env" ]]; then
+    echo "✔️ 检测到当前目录 .env，复制到脚本目录"
+    mkdir -p "$(dirname "$ENV_FILE")"
+    cp "./.env" "$ENV_FILE"
+  else
+    die "找不到 .env，请将其放到脚本目录或当前目录后重试"
+  fi
+
+  # —— 2) 安装依赖 & 生成 docker-compose 模板 —— 
+  install_all
+  generate_configs
+
+  # —— 2.1) 渲染 docker-compose.yaml —— 
+  echo "==> 渲染 docker-compose.yaml"
+  safe_cd "$SCRIPT_HOME"
+  envsubst < "$TPL_FILE" > "$COMPOSE_FILE" \
+    || die "渲染 $COMPOSE_FILE 失败"
+  echo "✔️ 已生成 $COMPOSE_FILE"
+
+  # —— 3) 安装 drosera-operator CLI —— 
+  echo "==> 安装 drosera-operator CLI"
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) TAG="x86_64-unknown-linux-gnu";;
+    aarch64|arm64) TAG="aarch64-unknown-linux-gnu";;
+    *) die "不支持的架构: $ARCH";;
+  esac
+  curl -fsSL \
+    "https://github.com/drosera-network/releases/releases/download/${TARGET_VERSION}/drosera-operator-${TARGET_VERSION}-${TAG}.tar.gz" \
+    -o /tmp/op.tar.gz
+  tar -xzf /tmp/op.tar.gz -C /usr/local/bin drosera-operator
+  rm /tmp/op.tar.gz
+  command -v drosera-operator &>/dev/null || die "drosera-operator 安装失败"
+  echo "✔️ drosera-operator ($(drosera-operator --version))"
+
+  # —— 4) 更新 toml 中 whitelist & address —— 
+  set -a; source "$ENV_FILE"; set +a
+  WL="\"$OPERATOR1_ADDRESS\",\"$OPERATOR2_ADDRESS\""
+  sed -i "/^whitelist/c\whitelist = [$WL]" "$TRAP_HOME/drosera.toml"
+  TRAP_ADDR=$(grep '^TRAP_ADDRESS=' "$ENV_FILE" | cut -d'=' -f2 | tr -d '"')
+  sed -i "s|^address *=.*|address = \"$TRAP_ADDR\"|" "$TRAP_HOME/drosera.toml"
+  echo "✔️ toml 更新：whitelist=[$WL]，address=\"$TRAP_ADDR\""
+
+  # —— 5) 拉取镜像 —— 
+  echo "==> 拉取镜像"
+  $COMPOSE_CMD -f "$COMPOSE_FILE" pull \
+    || die "镜像拉取失败"
+
+  # —— 6) 单私钥 apply —— 
+  echo "==> 应用 Trap Config（仅使用第一把私钥）"
+  # 切换到 Trap 目录，drosera apply 会自动读取该目录下的 drosera.toml
+  safe_cd "$TRAP_HOME"
+  retry=0
+  until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
+       drosera apply --eth-rpc-url "$ETH_RPC_URL"; do
+    ((retry++)) && [[ $retry -ge 3 ]] && die "ETH_PRIVATE_KEY apply 失败"
+    echo "等待冷却 ${COOLDOWN_WAIT}s… ($retry/3)"; sleep $COOLDOWN_WAIT
+  done
+  echo "✔️ ETH_PRIVATE_KEY apply 完成"
+  unset DROSERA_PRIVATE_KEY
+
+  # —— 7) 启动容器 —— 
+  echo "==> 启动容器"
+  $COMPOSE_CMD -f "$COMPOSE_FILE" up -d \
+    || die "容器启动失败"
+  echo "✔️ 服务器迁移完成"
+  read -rp "按任意键返回主菜单…" _
+}
+
+
+
+
+########## 查看日志 ##########
+view_logs(){
+  safe_cd "$SCRIPT_HOME"
+  echo "1) drosera  2) drosera2  3) 全部"
+  read -rp "日志选项: " c
+  case $c in
+    1) $COMPOSE_CMD logs -f drosera;;
+    2) $COMPOSE_CMD logs -f drosera2;;
+    3) $COMPOSE_CMD logs -f;;
+    *) echo "无效选项"; sleep 1;;
+  esac
+}
+
+########## 重启节点 ##########
+restart_nodes(){
+  safe_cd "$SCRIPT_HOME"
+  echo "1) drosera  2) drosera2  3) 全部"
+  read -rp "重启选项: " c
+  case $c in
+    1) $COMPOSE_CMD restart drosera;;
+    2) $COMPOSE_CMD restart drosera2;;
+    3) $COMPOSE_CMD down && $COMPOSE_CMD up -d;;
+    *) echo "无效选项"; sleep 1;;
+  esac
+}
+
+########## 一键部署 ##########
 one_click_deploy(){
   print_banner
   safe_cd "$SCRIPT_HOME"
@@ -435,29 +502,35 @@ one_click_deploy(){
   ETH_RPC_URL=${ETH_RPC_URL:-$FOUNDATION_RPC}
   read -rp "ETH 备用 RPC URL (默认 ${BACKUP_RPC}): " ETH_BACKUP_RPC_URL
   ETH_BACKUP_RPC_URL=${ETH_BACKUP_RPC_URL:-$BACKUP_RPC}
-  read -rp "首台 Operator 私钥: " ETH_PRIVATE_KEY
-  [[ -n "$ETH_PRIVATE_KEY" ]]||die
-  read -rp "首台 Operator 公钥地址: " OPERATOR1_ADDRESS
-  [[ -n "$OPERATOR1_ADDRESS" ]]||die
-  read -rp "是否部署第二台 Operator? [y/N]: " yn
-  [[ "$yn" =~ ^[Yy] ]] && read -rp "第二台 Operator 私钥: " ETH_PRIVATE_KEY2 && read -rp "第二台 Operator 公钥地址: " OPERATOR2_ADDRESS || { ETH_PRIVATE_KEY2=""; OPERATOR2_ADDRESS=""; }
-  read -rp "Bloom Boost 存入数量(ETH 建议≥2; 默认2): " BLOOM_BOOST_AMOUNT
+
+  read -rp "首台 私钥: " ETH_PRIVATE_KEY
+  read -rp "首台 公钥地址: " OPERATOR1_ADDRESS
+
+  read -rp "是否部署第二台? [y/N]: " yn
+  if [[ $yn =~ ^[Yy]$ ]]; then
+    read -rp "第二台 私钥: " ETH_PRIVATE_KEY2
+    read -rp "第二台 公钥地址: " OPERATOR2_ADDRESS
+  else
+    ETH_PRIVATE_KEY2=""; OPERATOR2_ADDRESS=""
+  fi
+
+  read -rp "Bloom Boost ETH 数量 (默认 2): " BLOOM_BOOST_AMOUNT
   BLOOM_BOOST_AMOUNT=${BLOOM_BOOST_AMOUNT:-2}
 
-  cat > "$ENV_FILE" <<EOF
-ETH_RPC_URL=$ETH_RPC_URL
-ETH_BACKUP_RPC_URL=$ETH_BACKUP_RPC_URL
-ETH_PRIVATE_KEY=$ETH_PRIVATE_KEY
-ETH_PRIVATE_KEY2=$ETH_PRIVATE_KEY2
-OPERATOR1_ADDRESS=$OPERATOR1_ADDRESS
-OPERATOR2_ADDRESS=$OPERATOR2_ADDRESS
-BLOOM_BOOST_AMOUNT=$BLOOM_BOOST_AMOUNT
-VPS_IP=$(curl -s https://api.ipify.org || echo "")
-# TRAP_ADDRESS 后续写入
+  # 写入 .env（RPC 链接加双引号；添加两个公钥参数）
+  cat > "$ENV_FILE" << EOF
+ETH_RPC_URL="${ETH_RPC_URL}"
+ETH_BACKUP_RPC_URL="${ETH_BACKUP_RPC_URL}"
+ETH_PRIVATE_KEY="${ETH_PRIVATE_KEY}"
+ETH_PRIVATE_KEY2="${ETH_PRIVATE_KEY2}"
+OPERATOR1_ADDRESS="${OPERATOR1_ADDRESS}"
+OPERATOR2_ADDRESS="${OPERATOR2_ADDRESS}"
+BLOOM_BOOST_AMOUNT="${BLOOM_BOOST_AMOUNT}"
+VPS_IP="$(curl -s https://api.ipify.org)"
 EOF
 
-  generate_configs
   install_all
+  generate_configs
   deploy_trap
   register_and_start
   [[ -n "$ETH_PRIVATE_KEY2" ]] && add_second_operator
@@ -465,50 +538,109 @@ EOF
   echo "✅ 一键部署完成！"
 }
 
-view_logs(){
+########## 升级节点到 ${TARGET_VERSION} ##########
+upgrade_nodes(){
+  init_env
+
+  [[ -n "${ETH_RPC_URL:-}"     ]] || die "ETH_RPC_URL 未设置，请先生成 .env"
+  [[ -n "${ETH_PRIVATE_KEY:-}" ]]  || die "ETH_PRIVATE_KEY 未设置，请先生成 .env"
+  [[ -n "${ETH_PRIVATE_KEY2:-}" ]] || die "ETH_PRIVATE_KEY2 未设置，请先添加第二台 Operator"
+
+  echo "==> 停止当前运行的节点容器"
   safe_cd "$SCRIPT_HOME"
-  echo "1) drosera  2) drosera2  3) 全部"
-  read -rp "日志选项: " c
-  case $c in
-    1) docker-compose -f "$COMPOSE_FILE" logs -f drosera;;
-    2) docker-compose -f "$COMPOSE_FILE" logs -f drosera2;;
-    3) docker-compose -f "$COMPOSE_FILE" logs -f;;
-    *) echo "无效"; sleep 1;;
-  esac
+  $COMPOSE_CMD stop drosera drosera2 || echo "[WARN] 停止容器时出错，可能已是停止状态"
+  sleep $WAIT_SHORT
+
+  # 1) 检查 Drosera CLI 版本
+  echo "==> 检查 Drosera CLI 版本"
+  inst_version=$("$HOME/.drosera/bin/drosera" --version | sed -E 's/^.*version[ v]*([0-9]+\.[0-9]+\.[0-9]+).*$/\1/')
+  if [[ "$inst_version" != "${TARGET_VERSION#v}" ]]; then
+    echo "==> 安装/升级 Drosera CLI 到 ${TARGET_VERSION}"
+    grep -qxF 'export PATH=$PATH:$HOME/.drosera/bin' ~/.bashrc || \
+      echo 'export PATH=$PATH:$HOME/.drosera/bin' >> ~/.bashrc
+    curl -fsSL https://app.drosera.io/install | bash || die "Drosera 安装失败"
+    set +u; source "$HOME/.bashrc"; set -u
+    droseraup || echo "[WARN] droseraup 执行失败"
+  else
+    echo "✔️ Drosera CLI 已是最新版本 ($inst_version)"
+  fi
+  sleep $WAIT_SHORT
+
+  # 2) 拉取所有服务镜像
+  echo "==> 拉取所有服务镜像"
+  safe_cd "$SCRIPT_HOME"
+  $COMPOSE_CMD pull
+  sleep $WAIT_SHORT
+
+  # 3) 更新 drosera.toml 中的 drosera_rpc
+  echo "==> 更新 Trap 配置中的 drosera_rpc"
+  safe_cd "$TRAP_HOME"
+  cp drosera.toml drosera.toml.bak-$(date +%s)
+  sed -i "s|^drosera_rpc = .*|drosera_rpc = \"${TARGET_RPC}\"|" drosera.toml
+  sleep $WAIT_SHORT
+
+  # 4) 双私钥 apply
+  for key in ETH_PRIVATE_KEY ETH_PRIVATE_KEY2; do
+    priv="${!key}"
+    retry=0
+    echo "==> ${key} apply"
+    until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$priv" drosera apply --eth-rpc-url "$ETH_RPC_URL"; do
+      ((retry++)) && [[ $retry -ge 3 ]] && die "${key} apply 重试失败"
+      echo "冷却 ${COOLDOWN_WAIT}s… ($retry/3)"; sleep $COOLDOWN_WAIT
+    done
+    echo "✔️ ${key} apply 完成"
+    unset DROSERA_PRIVATE_KEY
+    sleep $WAIT_SHORT
+  done
+
+  # 5) 重启所有容器
+  echo "==> 重启所有容器"
+  safe_cd "$SCRIPT_HOME"
+  $COMPOSE_CMD up -d
+  echo "✔️ 升级到 ${TARGET_VERSION} 完成"
+  read -rp "按任意键返回主菜单…" _
 }
 
-restart_nodes(){
-  safe_cd "$SCRIPT_HOME"
-  echo "1) drosera  2) drosera2  3) 全部"
-  read -rp "重启选项: " c
-  case $c in
-    1) docker-compose -f "$COMPOSE_FILE" restart drosera;;
-    2) docker-compose -f "$COMPOSE_FILE" restart drosera2;;
-    3) docker-compose -f "$COMPOSE_FILE" down && docker-compose -f "$COMPOSE_FILE" up -d;;
-    *) echo "无效"; sleep 1;;
-  esac
+########## 设置 Bloom Boost 百分比 ##########
+set_bloomboost_limit(){
+  init_env
+  echo "==> 设置 Bloom Boost 限制百分比"
+  read -rp "请输入百分比（如 100 表示 1%）: " pct
+  [[ -n "$pct" ]] || die "必须输入一个百分比"
+  safe_cd "$TRAP_HOME"
+  printf 'ofc\n' | drosera set-bloomboost-limit \
+    --eth-rpc-url      "${ETH_RPC_URL}" \
+    --drosera-rpc-url  "${TARGET_RPC}" \
+    --limit            "${pct}" \
+    || die "设置 Bloom Boost 限制失败"
+  echo "✔️ 已将 Bloom Boost 限制设置为 $pct"
 }
 
+########## 主菜单 ##########
 main_menu(){
   print_banner
   while true; do
-    cat <<EOF
+    cat << EOF
 
 === Drosera 自动部署脚本 ===
 1) 一键部署（傻瓜式）
-2) 设置 Bloom Boost 百分比
+2) 设置 Bloom Boost 限制
 3) 查看日志
 4) 重启节点
 5) 添加第二台 Operator
+6) 升级节点到 ${TARGET_VERSION}
+7) 服务器迁移
 0) 退出
 EOF
-    read -rp "请选择 [0-5]: " opt
+    read -rp "请选择 [0-7]: " opt
     case $opt in
       1) one_click_deploy;;
       2) set_bloomboost_limit;;
       3) view_logs;;
       4) restart_nodes;;
       5) add_second_operator;;
+      6) upgrade_nodes;;
+      7) migrate_server;;
       0) exit 0;;
       *) echo "无效选项"; sleep 1;;
     esac
