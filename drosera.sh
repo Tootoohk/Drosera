@@ -274,9 +274,9 @@ register_and_start(){
   # 1) 检测操作系统架构，决定下载哪种二进制
   ARCH=$(uname -m)
   case "$ARCH" in
-    x86_64)      ARCH_TAG="x86_64-unknown-linux-gnu";;
+    x86_64)        ARCH_TAG="x86_64-unknown-linux-gnu";;
     aarch64|arm64) ARCH_TAG="aarch64-unknown-linux-gnu";;
-    *)           die "不支持的架构: $ARCH";;
+    *)             die "不支持的架构: $ARCH";;
   esac
 
   # 2) 下载对应架构的 drosera-operator 并安装
@@ -307,24 +307,16 @@ register_and_start(){
   set -a; source "$ENV_FILE"; set +a
   sed -i "/^whitelist/c\whitelist = [\"${OPERATOR1_ADDRESS}\"]" drosera.toml
 
-  # 5) 在链上 apply 更新后的 whitelist（处理 ConfigUpdateCooldownNotElapsed 重试）
+  # 5) 在链上 apply 更新后的 whitelist
   echo "==> 链上更新 whitelist"
-  safe_cd "$TRAP_HOME"
   retry=0
   until printf 'ofc\n' | DROSERA_PRIVATE_KEY="$ETH_PRIVATE_KEY" \
-       drosera apply --eth-rpc-url "$ETH_RPC_URL" 2>&1 | tee /tmp/whitelist_apply.log; do
-    if grep -q "ConfigUpdateCooldownNotElapsed" /tmp/whitelist_apply.log; then
-      ((retry++)) && [[ $retry -ge 3 ]] && die "白名单 apply 冷却重试失败"
-      echo "⚠️ 白名单操作还在冷却时间内，等待 ${COOLDOWN_WAIT}s… ($retry/3)"
-      sleep $COOLDOWN_WAIT
-      continue
-    fi
-    cat /tmp/whitelist_apply.log
-    die "白名单 apply 失败，请查看 /tmp/whitelist_apply.log"
+       drosera apply --eth-rpc-url "$ETH_RPC_URL"; do
+    ((retry++)) && [[ $retry -ge 3 ]] && die "白名单 apply 失败"
+    echo "等待 ${COOLDOWN_WAIT}s… ($retry/3)"
+    sleep $COOLDOWN_WAIT
   done
   echo "✔️ 白名单 apply 完成"
-  rm /tmp/whitelist_apply.log
-
 
   # 6) 渲染并启动 drosera 容器（自动拉取最新镜像）
   echo "==> 渲染并启动 drosera 容器"
@@ -332,7 +324,21 @@ register_and_start(){
   envsubst < "$TPL_FILE" > "$COMPOSE_FILE" || die "渲染 $COMPOSE_FILE 失败"
   $COMPOSE_CMD up -d --pull=always drosera || die "容器启动失败"
   sleep $WAIT_SHORT
+
+  # 7) 第一台 Operator optin
+  echo "==> 第一台 Operator optin"
+  retry=0
+  until drosera-operator optin \
+      --eth-rpc-url "$ETH_RPC_URL" \
+      --eth-private-key "$ETH_PRIVATE_KEY" \
+      --trap-config-address "$TRAP_ADDRESS"; do
+    ((retry++)) && [[ $retry -ge 3 ]] && die "第一台 Opt-in 失败"
+    echo "等待 ${WAIT_SHORT}s… ($retry/3)"
+    sleep $WAIT_SHORT
+  done
+  echo "✔️ 第一台 Opt-in 成功"
 }
+
 
 ########## 5) 添加第二台 Operator ##########
 add_second_operator(){
